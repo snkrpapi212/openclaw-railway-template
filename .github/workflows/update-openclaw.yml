@@ -1,0 +1,80 @@
+name: Auto-update OpenClaw
+
+on:
+  schedule:
+    # Check for updates every day at midnight UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: 'Specific version to update to (e.g., v2026.2.6), or leave empty for latest'
+        required: false
+        default: ''
+
+jobs:
+  check-update:
+    runs-on: ubuntu-latest
+    outputs:
+      latest_version: ${{ steps.get_version.outputs.version }}
+      needs_update: ${{ steps.compare.outputs.needs_update }}
+      current_version: ${{ steps.compare.outputs.current }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get latest OpenClaw version
+        id: get_version
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/openclaw/openclaw/releases/latest | jq -r '.tag_name')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Latest OpenClaw release: $VERSION"
+
+      - name: Read current version from Dockerfile
+        id: compare
+        run: |
+          CURRENT=$(grep -oP 'ARG OPENCLAW_GIT_REF=\K[^$]+' Dockerfile || echo "main")
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          
+          if [ "$CURRENT" = "${{ steps.get_version.outputs.version }}" ]; then
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+            echo "Current version ($CURRENT) is up to date"
+          else
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+            echo "Update available: $CURRENT → ${{ steps.get_version.outputs.version }}"
+          fi
+
+  create-pr:
+    needs: check-update
+    if: needs.check-update.outputs.needs_update == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Dockerfile version
+        run: |
+          sed -i "s/ARG OPENCLAW_GIT_REF=.*/ARG OPENCLAW_GIT_REF=${{ needs.check-update.outputs.latest_version }}/" Dockerfile
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Dockerfile
+          git commit -m "chore: update OpenClaw to ${{ needs.check-update.outputs.latest_version }}"
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          title: "Update OpenClaw to ${{ needs.check-update.outputs.latest_version }}"
+          body: |
+            Auto-generated PR to update OpenClaw from `${{ needs.check-update.outputs.current_version }}` to `${{ needs.check-update.outputs.latest_version }}`.
+            
+            ## Changes
+            - Updated `OPENCLAW_GIT_REF` build argument in Dockerfile
+            
+            ## Release Notes
+            See [OpenClaw v${{ needs.check-update.outputs.latest_version }}](https://github.com/openclaw/openclaw/releases/tag/${{ needs.check-update.outputs.latest_version }})
+            
+            Please review and merge to trigger a redeploy.
+          branch: update/openclaw-${{ needs.check-update.outputs.latest_version }}
+          delete-branch: true
